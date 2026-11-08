@@ -1,6 +1,6 @@
 import {
   collection, doc, getDoc, getDocs, onSnapshot, query, runTransaction,
-  serverTimestamp, setDoc, updateDoc, where, writeBatch, increment,
+  serverTimestamp, setDoc, updateDoc, where, writeBatch,
 } from 'firebase/firestore';
 import { db } from './config';
 import { INITIAL_QUESTIONS, INITIAL_FFF_QUESTIONS, EXTRA_BANK_QUESTIONS, SpiritualQuestion } from '../game/questionBank';
@@ -10,8 +10,16 @@ import type { PublicGameState, AdminGameState } from '../context/GameContext';
 const publicRef = () => doc(db!, 'gameSessions', 'active', 'public', 'state');
 const adminRef = () => doc(db!, 'gameSessions', 'active', 'private', 'state');
 const participantsRef = () => collection(db!, 'gameSessions', 'active', 'participants');
+const seatsRef = () => collection(db!, 'gameSessions', 'active', 'seats');
 const submissionsRef = () => collection(db!, 'gameSessions', 'active', 'fffSubmissions');
 const votesRef = () => collection(db!, 'gameSessions', 'active', 'pollVotes');
+
+const addSeatPoolToBatch = (batch: ReturnType<typeof writeBatch>, sessionId: string, roomCode: string) => {
+  for (let seat = 1; seat <= 100; seat++) {
+    const seatId = `${sessionId}-seat-${String(seat).padStart(3, '0')}`;
+    batch.set(doc(seatsRef(), seatId), { sessionId, roomCode, claimed: false });
+  }
+};
 
 const makeInitialAdminState = (): AdminGameState => {
   const questions = JSON.parse(JSON.stringify(INITIAL_QUESTIONS)) as SpiritualQuestion[];
@@ -69,11 +77,21 @@ const toPublicState = (admin: AdminGameState): PublicGameState => {
 export async function ensureLiveGame(): Promise<void> {
   if (!db) throw new Error('Firestore is not configured.');
   const snapshot = await getDoc(adminRef());
-  if (snapshot.exists()) return;
+  if (snapshot.exists()) {
+    const current = snapshot.data() as AdminGameState;
+    const seats = await getDocs(query(seatsRef(), where('sessionId', '==', current.sessionId)));
+    if (seats.empty) {
+      const batch = writeBatch(db);
+      addSeatPoolToBatch(batch, current.sessionId, current.roomCode);
+      await batch.commit();
+    }
+    return;
+  }
   const initial = makeInitialAdminState();
   const batch = writeBatch(db);
   batch.set(adminRef(), { ...initial, timerEndsAt: null, pollEndsAt: null });
   batch.set(publicRef(), { ...toPublicState(initial), timerEndsAt: null, pollEndsAt: null });
+  addSeatPoolToBatch(batch, initial.sessionId, initial.roomCode);
   await batch.commit();
 }
 
@@ -92,34 +110,58 @@ export const subscribeAdminState = (next: (state: AdminGameState | null) => void
 };
 
 export const subscribeParticipants = (sessionId: string, next: (items: AdminGameState['participants']) => void, error: (e: Error) => void) => db ? onSnapshot(query(participantsRef(), where('sessionId', '==', sessionId)), s => next(s.docs.map(d => d.data() as AdminGameState['participants'][number])), error) : () => {};
+export const subscribeSeatCount = (sessionId: string, next: (count: number) => void, error: (e: Error) => void) => db ? onSnapshot(query(seatsRef(), where('sessionId', '==', sessionId)), s => next(s.docs.filter(d => d.data().claimed === true).length), error) : () => {};
 export const subscribeFffSubmissions = (start: number, next: (items: AdminGameState['fffSubmissions']) => void, error: (e: Error) => void) => db ? onSnapshot(query(submissionsRef(), where('roundStart', '==', start)), s => next(s.docs.map(d => {
   const v = d.data(); return { ...v, serverReceivedTimestamp: v.serverReceivedTimestamp?.toMillis?.() ?? v.serverReceivedTimestamp } as AdminGameState['fffSubmissions'][number];
 })), error) : () => {};
 export const subscribePollVotes = (pollId: string, next: (votes: Record<string, string>) => void, error: (e: Error) => void) => db ? onSnapshot(query(votesRef(), where('pollId', '==', pollId)), s => next(Object.fromEntries(s.docs.map(d => [d.id, d.data().optionKey]))), error) : () => {};
 
-function withTimer(admin: AdminGameState, timerEndsAt: number | null, pollEndsAt: number | null) {
+function withTimer(admin: AdminGameState, timerEndsAt: number | null, pollEndsAt: number | null, resetSeats = false) {
   const batch = writeBatch(db!);
   batch.set(adminRef(), { ...admin, timerEndsAt, pollEndsAt });
   batch.set(publicRef(), { ...toPublicState(admin), timerEndsAt, pollEndsAt });
+  if (resetSeats) addSeatPoolToBatch(batch, admin.sessionId, admin.roomCode);
   return batch.commit();
 }
 
 export async function registerGuest(name: string, roomCode: string, participantId: string): Promise<{ id: string; name: string } | null> {
   if (!db) return null;
   const cleanName = name.trim();
-  const pRef = doc(participantsRef(), participantId);
-  await runTransaction(db, async tx => {
-    const pub = await tx.get(publicRef());
-    if (!pub.exists()) throw new Error('The game is not ready yet. Ask the host to open the show controls.');
-    const state = pub.data() as PublicGameState;
+  void participantId;
+  if (cleanName.length < 2 || cleanName.length > 40) throw new Error('Name must be between 2 and 40 characters.');
+  const normalizedRoom = roomCode.trim().toUpperCase();
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const publicSnapshot = await getDoc(publicRef());
+    if (!publicSnapshot.exists()) throw new Error('The game is not ready yet. Ask the host to open the show controls.');
+    const state = publicSnapshot.data() as PublicGameState;
     if (!state.registrationOpen) throw new Error('Registration is currently closed by the operator.');
-    if (state.participantCount >= 100) throw new Error('This game is full. The host has reached the 100 audience limit.');
-    if (roomCode.trim().toUpperCase() !== state.roomCode.toUpperCase()) throw new Error(`Incorrect room code. Use ${state.roomCode}.`);
-    if (cleanName.length < 2) throw new Error('Please enter a name with at least 2 characters.');
-    tx.set(pRef, { id: participantId, name: cleanName, roomCode: state.roomCode, sessionId: state.sessionId, registeredAt: Date.now() });
-    tx.update(publicRef(), { participantCount: increment(1) });
-  });
-  return { id: participantId, name: cleanName };
+    if (normalizedRoom !== state.roomCode.toUpperCase()) throw new Error(`Incorrect room code. Use ${state.roomCode}.`);
+    const openSeats = await getDocs(query(seatsRef(), where('sessionId', '==', state.sessionId), where('claimed', '==', false)));
+    if (openSeats.empty) throw new Error('This game is full. The host has reached the 100 audience limit.');
+    const seatDoc = openSeats.docs[Math.floor(Math.random() * openSeats.size)];
+    const seatId = seatDoc.id;
+    const seatRef = doc(seatsRef(), seatId);
+    const pRef = doc(participantsRef(), seatId);
+    try {
+      await runTransaction(db, async tx => {
+        const [freshPublic, seatSnapshot] = await Promise.all([tx.get(publicRef()), tx.get(seatRef)]);
+        if (!freshPublic.exists()) throw new Error('The game is not ready yet. Ask the host to open the show controls.');
+        const fresh = freshPublic.data() as PublicGameState;
+        if (!fresh.registrationOpen) throw new Error('Registration is currently closed by the operator.');
+        if (fresh.sessionId !== state.sessionId || fresh.roomCode.toUpperCase() !== normalizedRoom) throw new Error('The room changed. Refresh and try again.');
+        if (!seatSnapshot.exists() || seatSnapshot.data().claimed !== false) throw new Error('SEAT_TAKEN');
+        tx.update(seatRef, { claimed: true });
+        tx.set(pRef, { id: seatId, seatId, name: cleanName, roomCode: fresh.roomCode, sessionId: fresh.sessionId, registeredAt: Date.now() });
+      });
+      return { id: seatId, name: cleanName };
+    } catch (cause) {
+      const error = cause as { code?: string; message?: string };
+      const retryable = error.message === 'SEAT_TAKEN' || ['permission-denied', 'aborted', 'failed-precondition'].includes(error.code ?? '');
+      if (!retryable || attempt === 11) throw cause;
+      await new Promise(resolve => setTimeout(resolve, 20 + Math.random() * 80));
+    }
+  }
+  throw new Error('Could not reserve a seat. Please try again.');
 }
 
 export async function submitGuestFff(participant: { id: string; name: string }, order: string[]): Promise<boolean> {
@@ -187,7 +229,7 @@ export async function executeLiveAdminAction(action: string, payload?: Record<st
   }
   next.activeQuestion = next.fullActiveQuestion ? { ...next.fullActiveQuestion, correctOption: next.activeQuestionRevealed ? next.fullActiveQuestion.correctOption : null, explanation: next.activeQuestionRevealed ? next.fullActiveQuestion.explanation : null } : null;
   next.fffQuestion = next.fullFffQuestion ?? next.fffQuestion;
-  await withTimer(next, timerEndsAt, pollEndsAt);
+  await withTimer(next, timerEndsAt, pollEndsAt, action === 'CREATE_SESSION');
   return true;
 }
 

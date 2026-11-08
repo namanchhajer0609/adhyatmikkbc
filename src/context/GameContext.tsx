@@ -7,7 +7,7 @@ import { onAuthStateChanged } from 'firebase/auth';
 import { auth } from '../firebase/config';
 import { staffRoleForEmail, StaffRole } from '../auth/staffRoles';
 import {
-  ensureLiveGame, subscribePublicState, subscribeAdminState, subscribeParticipants,
+  ensureLiveGame, subscribePublicState, subscribeAdminState, subscribeParticipants, subscribeSeatCount,
   subscribeFffSubmissions, subscribePollVotes, updatePollResults, registerGuest,
   submitGuestFff, submitGuestVote, executeLiveAdminAction, contestantSelect,
   contestantConfirm, contestantQuit as contestantQuitLive, resolveLocalTimerExpiry,
@@ -130,6 +130,7 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [clockNow, setClockNow] = useState(Date.now());
   const timerEndsAt = useRef<number | null>(null);
   const pollEndsAt = useRef<number | null>(null);
+  const participantCountRef = useRef<number | null>(null);
   const lastSoundRef = useRef(0);
 
   // Participant stored in localStorage for seamless reconnect
@@ -149,11 +150,24 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const unsubscribe = subscribePublicState((next, ends) => {
       timerEndsAt.current = ends.timer;
       pollEndsAt.current = ends.poll;
-      setState(next);
+      setState(prev => next ? {
+        ...next,
+        participantCount: prev?.sessionId === next.sessionId ? participantCountRef.current ?? next.participantCount : next.participantCount,
+      } : null);
       setConnectionStatus(next ? 'connected' : 'connecting');
     }, () => setConnectionStatus('disconnected'));
     return unsubscribe;
   }, []);
+
+  useEffect(() => {
+    if (!state?.sessionId) return;
+    const sessionId = state.sessionId;
+    participantCountRef.current = null;
+    return subscribeSeatCount(sessionId, count => {
+      participantCountRef.current = count;
+      setState(prev => prev?.sessionId === sessionId ? { ...prev, participantCount: count } : prev);
+    }, () => {});
+  }, [state?.sessionId]);
 
   useEffect(() => {
     if (!auth) return;

@@ -47,13 +47,7 @@ service cloud.firestore {
     match /gameSessions/active/public/state {
       allow read: if true;
       allow create, delete: if isAdminOrHost();
-      allow update: if isAdminOrHost() ||
-        (isPlayer() && validContestantUpdate()) ||
-        (request.auth == null &&
-          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['participantCount']) &&
-          resource.data.registrationOpen == true &&
-          resource.data.participantCount < 100 &&
-          request.resource.data.participantCount == resource.data.participantCount + 1);
+      allow update: if isAdminOrHost() || (isPlayer() && validContestantUpdate());
     }
 
     match /gameSessions/active/private/state {
@@ -65,12 +59,30 @@ service cloud.firestore {
     match /gameSessions/active/participants/{participantId} {
       allow read: if isStaff();
       allow create: if request.resource.data.id == participantId &&
+        request.resource.data.seatId == participantId &&
         request.resource.data.name is string && request.resource.data.name.size() >= 2 &&
         request.resource.data.name.size() <= 40 &&
         request.resource.data.roomCode == publicState().roomCode &&
         request.resource.data.sessionId == publicState().sessionId &&
-        publicState().registrationOpen == true && publicState().participantCount < 100;
+        publicState().registrationOpen == true &&
+        getAfter(/databases/$(database)/documents/gameSessions/active/seats/$(participantId)).data.claimed == true &&
+        getAfter(/databases/$(database)/documents/gameSessions/active/seats/$(participantId)).data.sessionId == publicState().sessionId;
       allow update, delete: if false;
+    }
+
+    match /gameSessions/active/seats/{seatId} {
+      allow read: if true;
+      allow create: if isAdminOrHost();
+      allow update: if request.auth == null &&
+        resource.data.claimed == false &&
+        request.resource.data.claimed == true &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['claimed']) &&
+        resource.data.sessionId == publicState().sessionId &&
+        resource.data.roomCode == publicState().roomCode &&
+        publicState().registrationOpen == true &&
+        existsAfter(/databases/$(database)/documents/gameSessions/active/participants/$(seatId)) &&
+        getAfter(/databases/$(database)/documents/gameSessions/active/participants/$(seatId)).data.seatId == seatId;
+      allow delete: if isAdminOrHost();
     }
 
     match /gameSessions/active/fffSubmissions/{participantId} {

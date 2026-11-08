@@ -1,14 +1,17 @@
-import React, { createContext, useContext, useEffect, useState, useCallback, useMemo } from 'react';
+import React, { createContext, useContext, useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { soundEngine } from '../utils/audio';
 import { PrizeLevel } from '../game/rules';
 import { SpiritualQuestion, FffQuestion } from '../game/questionBank';
 import { firebaseConfig, isFirebaseConfigured } from '../firebase/config';
+import { onAuthStateChanged } from 'firebase/auth';
+import { auth } from '../firebase/config';
+import { staffRoleForEmail, StaffRole } from '../auth/staffRoles';
 import {
-  syncGameStateToFirestore,
-  saveParticipantToFirestore,
-  saveFffSubmissionToFirestore,
-  savePollVoteToFirestore,
-} from '../firebase/firestoreSync';
+  ensureLiveGame, subscribePublicState, subscribeAdminState, subscribeParticipants,
+  subscribeFffSubmissions, subscribePollVotes, updatePollResults, registerGuest,
+  submitGuestFff, submitGuestVote, executeLiveAdminAction, contestantSelect,
+  contestantConfirm, contestantQuit as contestantQuitLive, resolveLocalTimerExpiry,
+} from '../firebase/liveGame';
 
 export interface PublicGameState {
   sessionId: string;
@@ -110,7 +113,7 @@ interface GameContextType {
   setTimerMode: (mode: 45 | 60 | 0) => Promise<boolean>;
   addQuestion: (q: Omit<SpiritualQuestion, 'id'>) => Promise<boolean>;
   setLadderQuestion: (questionId: string, ladderLevel: number) => Promise<boolean>;
-  currentParticipant: { id: string; name: string } | null;
+  currentParticipant: { id: string; name: string; sessionId?: string } | null;
   error: string | null;
   clearError: () => void;
 }
@@ -123,9 +126,14 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [connectionStatus, setConnectionStatus] = useState<'connected' | 'connecting' | 'disconnected'>('connecting');
   const [error, setError] = useState<string | null>(null);
   const [lastSoundTimestamp, setLastSoundTimestamp] = useState<number>(0);
+  const [staffRole, setStaffRole] = useState<StaffRole | null>(null);
+  const [clockNow, setClockNow] = useState(Date.now());
+  const timerEndsAt = useRef<number | null>(null);
+  const pollEndsAt = useRef<number | null>(null);
+  const lastSoundRef = useRef(0);
 
   // Participant stored in localStorage for seamless reconnect
-  const [currentParticipant, setCurrentParticipant] = useState<{ id: string; name: string } | null>(() => {
+  const [currentParticipant, setCurrentParticipant] = useState<{ id: string; name: string; sessionId?: string } | null>(() => {
     try {
       const saved = localStorage.getItem('akbc_participant');
       return saved ? JSON.parse(saved) : null;
@@ -136,135 +144,130 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const clearError = useCallback(() => setError(null), []);
 
-  // Fetch full state once via REST
-  const refreshState = useCallback(async () => {
-    try {
-      const [resPublic, resAdmin] = await Promise.all([
-        fetch('/api/state'),
-        fetch('/api/admin/state').catch(() => null),
-      ]);
-      if (resPublic.ok) {
-        const data = await resPublic.json();
-        setState(data);
-        setConnectionStatus('connected');
-      }
-      if (resAdmin && resAdmin.ok) {
-        const dataAdmin = await resAdmin.json();
-        setAdminState(dataAdmin);
-      }
-    } catch {
-      setConnectionStatus('disconnected');
-    }
+  // The static Hosting app shares live show state through Firestore.
+  useEffect(() => {
+    const unsubscribe = subscribePublicState((next, ends) => {
+      timerEndsAt.current = ends.timer;
+      pollEndsAt.current = ends.poll;
+      setState(next);
+      setConnectionStatus(next ? 'connected' : 'connecting');
+    }, () => setConnectionStatus('disconnected'));
+    return unsubscribe;
   }, []);
 
-  // Real-time synchronization via Server-Sent Events (SSE)
   useEffect(() => {
-    let sse: EventSource | null = null;
-    let pollFallback: NodeJS.Timeout | null = null;
+    if (!auth) return;
+    return onAuthStateChanged(auth, user => setStaffRole(staffRoleForEmail(user?.email)));
+  }, []);
 
-    function connectSSE() {
-      setConnectionStatus('connecting');
-      sse = new EventSource('/api/stream');
+  useEffect(() => {
+    if (staffRole !== 'admin' && staffRole !== 'host') return;
+    ensureLiveGame().catch(cause => setError(cause instanceof Error ? cause.message : 'Could not connect to Firestore.'));
+  }, [staffRole]);
 
-      sse.onopen = () => {
-        setConnectionStatus('connected');
-      };
-
-      sse.addEventListener('state', (event) => {
-        try {
-          const parsed: PublicGameState = JSON.parse(event.data);
-          setState(parsed);
-          setConnectionStatus('connected');
-
-          // Trigger sound if new sound trigger
-          if (parsed.soundTrigger && parsed.soundTrigger.timestamp > lastSoundTimestamp) {
-            setLastSoundTimestamp(parsed.soundTrigger.timestamp);
-            soundEngine.setMuted(!parsed.soundEnabled);
-            soundEngine.play(parsed.soundTrigger.type);
-          }
-        } catch (err) {
-          console.error('SSE state parse error:', err);
-        }
-      });
-
-      sse.addEventListener('admin-state', (event) => {
-        try {
-          const parsedAdmin: AdminGameState = JSON.parse(event.data);
-          setAdminState(parsedAdmin);
-        } catch (err) {
-          console.error('SSE admin-state parse error:', err);
-        }
-      });
-
-      sse.onerror = () => {
-        setConnectionStatus('disconnected');
-        sse?.close();
-        // Try reconnect in 3 seconds
-        setTimeout(connectSSE, 3000);
-      };
+  useEffect(() => {
+    if (staffRole !== 'admin' && staffRole !== 'host') {
+      setAdminState(null);
+      return;
     }
+    if (!state?.sessionId) return;
+    let stopAdmin = () => {};
+    let stopPeople = () => {};
+    stopAdmin = subscribeAdminState(next => setAdminState(prev => next ? {
+      ...next,
+      participants: prev?.participants ?? next.participants,
+      fffSubmissions: prev?.fffSubmissions ?? next.fffSubmissions,
+      audiencePollVotes: prev?.audiencePollVotes ?? next.audiencePollVotes,
+    } : null), () => setError('Could not read show controls.'));
+    stopPeople = subscribeParticipants(state.sessionId, items => setAdminState(prev => prev ? { ...prev, participants: items } : prev), () => {});
+    return () => { stopAdmin(); stopPeople(); };
+  }, [staffRole, state?.sessionId]);
 
-    connectSSE();
+  useEffect(() => {
+    if (!state || !currentParticipant || currentParticipant.sessionId === state.sessionId) return;
+    localStorage.removeItem('akbc_participant');
+    setCurrentParticipant(null);
+  }, [state?.sessionId, currentParticipant?.sessionId]);
 
-    // Secondary backup poll every 2 seconds for guaranteed resilience
-    pollFallback = setInterval(refreshState, 2000);
+  useEffect(() => {
+    if ((staffRole !== 'admin' && staffRole !== 'host') || !state || state.stage !== 'FFF_ACTIVE') return;
+    return subscribeFffSubmissions(state.fffStartTime, items => setAdminState(prev => prev ? { ...prev, fffSubmissions: items } : prev), () => {});
+  }, [staffRole, state?.stage, state?.fffStartTime]);
 
-    return () => {
-      sse?.close();
-      if (pollFallback) clearInterval(pollFallback);
-    };
-  }, [refreshState, lastSoundTimestamp]);
+  useEffect(() => {
+    if (staffRole !== 'admin' && staffRole !== 'host') return;
+    const pollId = (adminState as (AdminGameState & { pollId?: string }) | null)?.pollId;
+    if (!pollId) return;
+    return subscribePollVotes(pollId, votes => {
+      setAdminState(prev => prev ? { ...prev, audiencePollVotes: votes } : prev);
+      void updatePollResults(votes).catch(() => {});
+    }, () => {});
+  }, [staffRole, (adminState as (AdminGameState & { pollId?: string }) | null)?.pollId]);
+
+  useEffect(() => {
+    if (timerEndsAt.current === null && pollEndsAt.current === null) return;
+    const interval = window.setInterval(() => {
+      const now = Date.now();
+      setClockNow(now);
+      if ((staffRole === 'admin' || staffRole === 'host') &&
+        ((timerEndsAt.current !== null && timerEndsAt.current <= now) || (pollEndsAt.current !== null && pollEndsAt.current <= now))) {
+        void resolveLocalTimerExpiry().catch(() => {});
+      }
+    }, 500);
+    return () => window.clearInterval(interval);
+  }, [state?.timer?.isRunning, state?.lifelines?.audiencePoll?.active, staffRole]);
+
+  useEffect(() => {
+    const sound = state?.soundTrigger;
+    if (!sound || sound.timestamp <= lastSoundRef.current) return;
+    lastSoundRef.current = sound.timestamp;
+    setLastSoundTimestamp(sound.timestamp);
+    soundEngine.setMuted(!state.soundEnabled);
+    soundEngine.play(sound.type);
+  }, [state?.soundTrigger?.timestamp, state?.soundEnabled]);
+
+  useEffect(() => {
+    if (!state) return;
+    const timerRemaining = timerEndsAt.current === null ? state.timer.secondsRemaining : Math.max(0, Math.ceil((timerEndsAt.current - clockNow) / 1000));
+    const pollRemaining = pollEndsAt.current === null ? state.lifelines.audiencePoll.secondsRemaining : Math.max(0, Math.ceil((pollEndsAt.current - clockNow) / 1000));
+    setState(prev => prev ? {
+      ...prev,
+      timer: { ...prev.timer, secondsRemaining: timerRemaining },
+      lifelines: { ...prev.lifelines, audiencePoll: { ...prev.lifelines.audiencePoll, secondsRemaining: pollRemaining } },
+    } : prev);
+  }, [clockNow]);
 
   // Admin action dispatcher
   const executeAdminAction = useCallback(async (action: string, payload?: Record<string, unknown>): Promise<boolean> => {
-    try {
-      const res = await fetch('/api/admin/action', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, payload }),
-      });
-      if (!res.ok) {
-        const err = await res.json();
-        setError(err.error || 'Admin action failed');
-        return false;
-      }
-      return true;
-    } catch {
-      setError('Network communication failed.');
+    if (staffRole !== 'admin' && staffRole !== 'host') {
+      setError('Sign in with a host or admin account to control the show.');
       return false;
     }
-  }, []);
+    try {
+      return await executeLiveAdminAction(action, payload);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Show action failed.');
+      return false;
+    }
+  }, [staffRole]);
 
   // Register participant from /join
   const registerParticipant = useCallback(async (name: string, roomCode?: string) => {
     try {
-      const res = await fetch('/api/participant/register', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, roomCode }),
-      });
-      if (!res.ok) {
-        const data = await res.json();
-        setError(data.error || 'Failed to register');
-        return null;
-      }
-      const data = await res.json();
-      setCurrentParticipant(data.participant);
-      try {
-        localStorage.setItem('akbc_participant', JSON.stringify(data.participant));
-      } catch {
-        // storage quota fallback
-      }
-      // Sync to Firebase Firestore project kaunbanegacrorepati
-      if (state?.sessionId) {
-        saveParticipantToFirestore(state.sessionId, data.participant).catch(() => {});
-      }
-      return data.participant;
-    } catch {
-      setError('Registration server unavailable.');
+      const id = currentParticipant?.sessionId === state?.sessionId && currentParticipant?.id
+        ? currentParticipant.id
+        : (typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `guest-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      const participant = await registerGuest(name, roomCode ?? state?.roomCode ?? '', id);
+      if (!participant) return null;
+      const savedParticipant = { ...participant, sessionId: state?.sessionId };
+      setCurrentParticipant(savedParticipant);
+      localStorage.setItem('akbc_participant', JSON.stringify(savedParticipant));
+      return savedParticipant;
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Registration failed.');
       return null;
     }
-  }, [state?.sessionId]);
+  }, [currentParticipant?.id, state?.roomCode]);
 
   // Submit FFF ordering
   const submitFffOrder = useCallback(
@@ -274,37 +277,13 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
         return false;
       }
       try {
-        const res = await fetch('/api/participant/fff/submit', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            participantId: currentParticipant.id,
-            name: currentParticipant.name,
-            submittedOrder: order,
-          }),
-        });
-        if (!res.ok) {
-          const data = await res.json();
-          setError(data.error || 'Submission error');
-          return false;
-        }
-        // Sync to Firebase Firestore project kaunbanegacrorepati
-        if (state?.sessionId) {
-          saveFffSubmissionToFirestore(state.sessionId, {
-            participantId: currentParticipant.id,
-            name: currentParticipant.name,
-            submittedOrder: order,
-            serverReceivedTimestamp: Date.now(),
-            sequenceNumber: 0,
-          }).catch(() => {});
-        }
-        return true;
-      } catch {
-        setError('Could not submit answer.');
+        return await submitGuestFff(currentParticipant, order);
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : 'Could not submit answer.');
         return false;
       }
     },
-    [currentParticipant, state?.sessionId]
+    [currentParticipant]
   );
 
   // Vote in audience poll
@@ -315,67 +294,45 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
         return false;
       }
       try {
-        const res = await fetch('/api/participant/poll/vote', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            participantId: currentParticipant.id,
-            optionKey,
-          }),
-        });
-        if (!res.ok) {
-          const data = await res.json();
-          setError(data.error || 'Voting closed');
-          return false;
-        }
-        // Sync to Firebase Firestore project kaunbanegacrorepati
-        if (state?.sessionId) {
-          savePollVoteToFirestore(state.sessionId, currentParticipant.id, optionKey).catch(() => {});
-        }
-        return true;
-      } catch {
-        setError('Could not register vote.');
+        return await submitGuestVote(currentParticipant, optionKey);
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : 'Could not register vote.');
         return false;
       }
     },
-    [currentParticipant, state?.sessionId]
+    [currentParticipant]
   );
 
   // Contestant options
   const contestantSelectOption = useCallback(async (optionKey: 'A' | 'B' | 'C' | 'D'): Promise<boolean> => {
+    if (staffRole !== 'player') return false;
     try {
-      const res = await fetch('/api/contestant/select-option', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ optionKey }),
-      });
-      return res.ok;
-    } catch {
+      return await contestantSelect(optionKey);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Could not select that answer.');
       return false;
     }
-  }, []);
+  }, [staffRole]);
 
   const contestantConfirmAnswer = useCallback(async (): Promise<boolean> => {
+    if (staffRole !== 'player') return false;
     try {
-      const res = await fetch('/api/contestant/confirm-answer', {
-        method: 'POST',
-      });
-      return res.ok;
-    } catch {
+      return await contestantConfirm();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Could not lock the answer.');
       return false;
     }
-  }, []);
+  }, [staffRole]);
 
   const contestantQuit = useCallback(async (): Promise<boolean> => {
+    if (staffRole !== 'player') return false;
     try {
-      const res = await fetch('/api/contestant/quit', {
-        method: 'POST',
-      });
-      return res.ok;
-    } catch {
+      return await contestantQuitLive();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Could not quit the game.');
       return false;
     }
-  }, []);
+  }, [staffRole]);
 
   const setTimerMode = useCallback(
     async (mode: 45 | 60 | 0): Promise<boolean> => {
@@ -413,6 +370,7 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
       contestantSelectOption,
       contestantConfirmAnswer,
       contestantQuit,
+      staffRole,
       setTimerMode,
       addQuestion,
       setLadderQuestion,
@@ -432,6 +390,7 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
       contestantSelectOption,
       contestantConfirmAnswer,
       contestantQuit,
+      staffRole,
       setTimerMode,
       addQuestion,
       setLadderQuestion,

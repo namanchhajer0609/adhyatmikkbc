@@ -132,7 +132,7 @@ export const ParticipantMobile: React.FC = () => {
           </div>
           <div>
             <h1 className="text-sm font-bold text-amber-400 font-cinzel">Adhyatmik KBC</h1>
-            <span className="text-[10px] text-slate-400">Live Participant Arena</span>
+            <span className="text-[10px] text-slate-400">Live Audience</span>
           </div>
         </div>
 
@@ -192,7 +192,7 @@ export const ParticipantMobile: React.FC = () => {
             <div className="w-16 h-16 mx-auto rounded-2xl bg-amber-500/20 border border-amber-500/50 flex items-center justify-center text-amber-400 text-2xl font-cinzel shadow-xl gold-glow">
               ॐ
             </div>
-            <h2 className="text-2xl font-black text-amber-300 font-cinzel">Join Spiritual Arena</h2>
+            <h2 className="text-2xl font-black text-amber-300 font-cinzel">Join the Audience</h2>
             <p className="text-xs text-slate-300 max-w-xs mx-auto">
               Look at the projector screen for the <strong>Room Code</strong>, enter your name, and take part in the show!
             </p>
@@ -241,7 +241,7 @@ export const ParticipantMobile: React.FC = () => {
               disabled={isRegistering || !inputName.trim()}
               className="w-full py-4 rounded-xl bg-gradient-to-r from-amber-500 via-amber-400 to-amber-600 hover:from-amber-400 hover:to-amber-500 disabled:opacity-50 text-slate-950 font-black text-sm shadow-xl transition-transform active:scale-95 gold-glow uppercase tracking-wider"
             >
-              {isRegistering ? 'Verifying Room...' : 'Enter Hot Seat Arena'}
+              {isRegistering ? 'Joining the show…' : 'Join the show'}
             </button>
 
             <div className="pt-2 border-t border-slate-800 text-[10px] text-slate-400 text-center space-y-1">

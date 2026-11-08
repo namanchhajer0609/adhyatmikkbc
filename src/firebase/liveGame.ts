@@ -17,9 +17,10 @@ const makeInitialAdminState = (): AdminGameState => {
   const questions = JSON.parse(JSON.stringify(INITIAL_QUESTIONS)) as SpiritualQuestion[];
   const fffBank = JSON.parse(JSON.stringify(INITIAL_FFF_QUESTIONS));
   const full = questions.find(q => q.ladderLevel === 1) ?? questions[0] ?? null;
+  const firstFff = fffBank[0];
   return {
     sessionId: `session-${Date.now().toString(36)}`, roomCode: 'KBC-108', stage: 'REGISTRATION',
-    registrationOpen: true, participantCount: 0, fffQuestion: { ...fffBank[0], correctOrder: undefined },
+    registrationOpen: true, participantCount: 0, fffQuestion: { id: firstFff.id, question: firstFff.question, instruction: firstFff.instruction, items: firstFff.items, category: firstFff.category },
     fffStartTime: 0, fffWinner: null, hotSeatContestant: null, currentLadderLevel: 1,
     activeQuestion: full ? { ...full, correctOption: null, explanation: null } : null,
     activeQuestionRevealed: false, selectedOption: null, isAnswerCorrect: null, lastSecuredMilestone: 0,
@@ -28,35 +29,40 @@ const makeInitialAdminState = (): AdminGameState => {
     soundTrigger: null, soundEnabled: true, prizeLadder: PRIZE_LADDER,
     fullActiveQuestion: full, fullFffQuestion: fffBank[0], participants: [], fffSubmissions: [],
     questionsLadder: questions, questionBank: JSON.parse(JSON.stringify(EXTRA_BANK_QUESTIONS)),
-    fffBank, audiencePollVotes: {},
+    fffBank, audiencePollVotes: {}, usedContestantIds: [],
   } as unknown as AdminGameState;
 };
 
 const toPublicState = (admin: AdminGameState): PublicGameState => {
   const active = admin.fullActiveQuestion;
   const fff = admin.fullFffQuestion;
+  const {
+    fullActiveQuestion: _fullActiveQuestion,
+    fullFffQuestion: _fullFffQuestion,
+    participants: _participants,
+    fffSubmissions: _fffSubmissions,
+    questionsLadder: _questionsLadder,
+    questionBank: _questionBank,
+    fffBank: _fffBank,
+    audiencePollVotes: _audiencePollVotes,
+    usedContestantIds: _usedContestantIds,
+    ...safeState
+  } = admin as AdminGameState & { usedContestantIds?: string[]; pollId?: string };
   return {
-    ...admin,
+    ...safeState,
     activeQuestion: active ? {
       id: active.id, ladderLevel: active.ladderLevel, question: active.question, options: active.options,
-      category: active.category, difficulty: active.difficulty, supportingReference: active.supportingReference,
+      category: active.category, difficulty: active.difficulty,
+      ...(active.supportingReference ? { supportingReference: active.supportingReference } : {}),
       correctOption: admin.activeQuestionRevealed ? active.correctOption : null,
       explanation: admin.activeQuestionRevealed ? active.explanation : null,
     } : null,
     fffQuestion: fff ? {
       id: fff.id, question: fff.question, instruction: fff.instruction,
       items: fff.items.map(i => ({ id: i.id, text: i.text })), category: fff.category,
-      explanation: admin.stage === 'FFF_WINNER' ? fff.explanation : undefined,
+      ...(admin.stage === 'FFF_WINNER' && fff.explanation ? { explanation: fff.explanation } : {}),
     } : admin.fffQuestion,
-    correctOption: undefined,
-    fullActiveQuestion: undefined,
-    fullFffQuestion: undefined,
-    participants: undefined,
-    fffSubmissions: undefined,
-    questionsLadder: undefined,
-    questionBank: undefined,
-    fffBank: undefined,
-    audiencePollVotes: undefined,
+    ...((admin as AdminGameState & { pollId?: string }).pollId ? { pollId: (admin as AdminGameState & { pollId?: string }).pollId } : {}),
   } as unknown as PublicGameState;
 };
 
@@ -85,7 +91,7 @@ export const subscribeAdminState = (next: (state: AdminGameState | null) => void
   return onSnapshot(adminRef(), snap => next(snap.exists() ? snap.data() as AdminGameState : null), error);
 };
 
-export const subscribeParticipants = (next: (items: AdminGameState['participants']) => void, error: (e: Error) => void) => db ? onSnapshot(participantsRef(), s => next(s.docs.map(d => d.data() as AdminGameState['participants'][number])), error) : () => {};
+export const subscribeParticipants = (sessionId: string, next: (items: AdminGameState['participants']) => void, error: (e: Error) => void) => db ? onSnapshot(query(participantsRef(), where('sessionId', '==', sessionId)), s => next(s.docs.map(d => d.data() as AdminGameState['participants'][number])), error) : () => {};
 export const subscribeFffSubmissions = (start: number, next: (items: AdminGameState['fffSubmissions']) => void, error: (e: Error) => void) => db ? onSnapshot(query(submissionsRef(), where('roundStart', '==', start)), s => next(s.docs.map(d => {
   const v = d.data(); return { ...v, serverReceivedTimestamp: v.serverReceivedTimestamp?.toMillis?.() ?? v.serverReceivedTimestamp } as AdminGameState['fffSubmissions'][number];
 })), error) : () => {};
@@ -102,17 +108,20 @@ export async function registerGuest(name: string, roomCode: string, participantI
   if (!db) return null;
   const cleanName = name.trim();
   const pRef = doc(participantsRef(), participantId);
-  const existing = await getDoc(pRef);
-  if (existing.exists()) return { id: participantId, name: String(existing.data().name) };
   await runTransaction(db, async tx => {
     const [pub, person] = await Promise.all([tx.get(publicRef()), tx.get(pRef)]);
     if (!pub.exists()) throw new Error('The game is not ready yet. Ask the host to open the show controls.');
     const state = pub.data() as PublicGameState;
+    if (person.exists()) {
+      if (person.data().sessionId === state.sessionId) return;
+      throw new Error('Refresh the page and join the current show again.');
+    }
     if (!state.registrationOpen) throw new Error('Registration is currently closed by the operator.');
+    if (state.participantCount >= 100) throw new Error('This game is full. The host has reached the 100 audience limit.');
     if (roomCode.trim().toUpperCase() !== state.roomCode.toUpperCase()) throw new Error(`Incorrect room code. Use ${state.roomCode}.`);
     if (cleanName.length < 2) throw new Error('Please enter a name with at least 2 characters.');
     if (person.exists()) return;
-    tx.set(pRef, { id: participantId, name: cleanName, roomCode: state.roomCode, registeredAt: Date.now() });
+    tx.set(pRef, { id: participantId, name: cleanName, roomCode: state.roomCode, sessionId: state.sessionId, registeredAt: Date.now() });
     tx.update(publicRef(), { participantCount: increment(1) });
   });
   return { id: participantId, name: cleanName };
@@ -123,6 +132,7 @@ export async function submitGuestFff(participant: { id: string; name: string }, 
   const [pub, person] = await Promise.all([getDoc(publicRef()), getDoc(doc(participantsRef(), participant.id))]);
   if (!pub.exists() || !person.exists()) throw new Error('Join the audience first.');
   const state = pub.data() as PublicGameState;
+  if (person.data().sessionId !== state.sessionId) throw new Error('Refresh and join the current show again.');
   if (state.stage !== 'FFF_ACTIVE' || order.length !== 4) throw new Error('Fastest Finger First is not accepting this submission.');
   const oldRef = doc(submissionsRef(), participant.id);
   const old = await getDoc(oldRef);
@@ -152,9 +162,10 @@ export async function updatePollResults(votes: Record<string,string>): Promise<v
 
 export async function executeLiveAdminAction(action: string, payload?: Record<string, unknown>): Promise<boolean> {
   if (!db) return false;
-  const [snap, submissions] = await Promise.all([getDoc(adminRef()), action === 'END_FFF' ? getDocs(query(submissionsRef(), where('roundStart', '==', (await getDoc(adminRef())).data()?.fffStartTime))) : Promise.resolve(null)]);
+  const snap = await getDoc(adminRef());
   if (!snap.exists()) throw new Error('Open the show once to initialize it.');
   const s = snap.data() as AdminGameState & { timerEndsAt?: number | null; pollEndsAt?: number | null; pollId?: string };
+  const submissions = action === 'END_FFF' ? await getDocs(query(submissionsRef(), where('roundStart', '==', s.fffStartTime))) : null;
   const next = structuredClone(s) as typeof s;
   let timerEndsAt = s.timerEndsAt ?? null;
   let pollEndsAt = s.pollEndsAt ?? null;
@@ -167,8 +178,8 @@ export async function executeLiveAdminAction(action: string, payload?: Record<st
     case 'TOGGLE_REGISTRATION': next.registrationOpen = !next.registrationOpen; break;
     case 'SET_FFF_QUESTION': { const q=next.fffBank.find(x=>x.id===payload?.questionId); if(q){next.fullFffQuestion=q;next.fffQuestion=q;} next.stage='FFF_INTRO';next.fffSubmissions=[];next.fffWinner=null;setSound('fff-intro');break; }
     case 'START_FFF': next.stage='FFF_ACTIVE';next.fffStartTime=now;next.fffSubmissions=[];next.fffWinner=null;startTimer(duration);setSound('timer');break;
-    case 'END_FFF': { next.stage='FFF_WINNER';next.timer.isRunning=false;timerEndsAt=null;const rows=(submissions?.docs??[]).map(d=>{const v=d.data();return {...v,serverReceivedTimestamp:v.serverReceivedTimestamp?.toMillis?.()??now,sequenceNumber:0};}) as AdminGameState['fffSubmissions'];const result=determineFffWinner(rows,next.fullFffQuestion?.correctOrder??[],next.fffStartTime);next.fffSubmissions=rows;next.fffWinner=result.winner?{participantId:result.winner.participantId,name:result.winner.name,timeTakenMs:result.winner.timeTakenMs}:null;if(next.fffWinner)setSound('winner');break; }
-    case 'CONFIRM_HOT_SEAT_WINNER': {const name=String(payload?.name??next.fffWinner?.name??'Contestant');const id=String(payload?.participantId??next.fffWinner?.participantId??'contestant-1');next.hotSeatContestant={id,name,pointsWon:0};next.currentLadderLevel=1;next.fullActiveQuestion=next.questionsLadder.find(q=>q.ladderLevel===1)??next.questionsLadder[0]??null;next.stage='HOT_SEAT_INTRO';next.activeQuestionRevealed=false;next.selectedOption=null;next.isAnswerCorrect=null;setSound('hot-seat-welcome');break;}
+    case 'END_FFF': { next.stage='FFF_WINNER';next.timer.isRunning=false;timerEndsAt=null;const used=new Set((next as typeof next & {usedContestantIds?:string[]}).usedContestantIds??[]);const allRows=(submissions?.docs??[]).map(d=>{const v=d.data();return {...v,serverReceivedTimestamp:v.serverReceivedTimestamp?.toMillis?.()??now,sequenceNumber:0};}) as AdminGameState['fffSubmissions'];const rows=allRows.filter(v=>!used.has(String(v.participantId)));const result=determineFffWinner(rows,next.fullFffQuestion?.correctOrder??[],next.fffStartTime);next.fffSubmissions=rows;next.fffWinner=result.winner?{participantId:result.winner.participantId,name:result.winner.name,timeTakenMs:result.winner.timeTakenMs}:null;if(next.fffWinner)setSound('winner');break; }
+    case 'CONFIRM_HOT_SEAT_WINNER': {const name=String(payload?.name??next.fffWinner?.name??'Contestant');const id=String(payload?.participantId??next.fffWinner?.participantId??'contestant-1');next.hotSeatContestant={id,name,pointsWon:0};(next as typeof next & {usedContestantIds?:string[]}).usedContestantIds=[...new Set([...(next as typeof next & {usedContestantIds?:string[]}).usedContestantIds??[],id])];next.currentLadderLevel=1;next.fullActiveQuestion=next.questionsLadder.find(q=>q.ladderLevel===1)??next.questionsLadder[0]??null;next.stage='HOT_SEAT_INTRO';next.activeQuestionRevealed=false;next.selectedOption=null;next.isAnswerCorrect=null;setSound('hot-seat-welcome');break;}
     case 'START_QUESTION': {const level=Number(payload?.ladderLevel)||next.currentLadderLevel;next.currentLadderLevel=level;next.fullActiveQuestion=next.questionsLadder.find(q=>q.ladderLevel===level)??next.fullActiveQuestion;next.stage='QUESTION_ACTIVE';next.activeQuestionRevealed=false;next.selectedOption=null;next.isAnswerCorrect=null;next.lifelines.fiftyFifty.active=false;next.lifelines.fiftyFifty.hiddenOptions=[];next.lifelines.audiencePoll.active=false;next.lifelines.audiencePoll.percentages={A:0,B:0,C:0,D:0};next.lifelines.audiencePoll.totalVotes=0;startTimer(next.timer.timerMode);setSound('question-appear');break;}
     case 'SET_TIMER_MODE': {const mode=Number(payload?.timerMode);if([0,45,60].includes(mode)){next.timer.timerMode=mode as 0|45|60;startTimer(next.stage==='QUESTION_ACTIVE'?mode:0);}break;}
     case 'TIMER_CONTROL': {const control=payload?.action;if(control==='START'&&next.timer.timerMode!==0){next.timer.isRunning=true;timerEndsAt=now+next.timer.secondsRemaining*1000;}else if(control==='PAUSE'){next.timer.isRunning=false;timerEndsAt=null;}else if(control==='RESET'){const n=next.timer.timerMode===0?0:Number(payload?.duration)||next.timer.timerMode;startTimer(n);}break;}
@@ -190,9 +201,9 @@ export async function executeLiveAdminAction(action: string, payload?: Record<st
   return true;
 }
 
-export async function contestantSelect(option: 'A'|'B'|'C'|'D') { if(!db) return false; await updateDoc(publicRef(),{selectedOption:option}); return true; }
-export async function contestantConfirm() { if(!db) return false; await updateDoc(publicRef(),{stage:'ANSWER_LOCKED','timer.isRunning':false,timerEndsAt:null}); return true; }
-export async function contestantQuit() { if(!db) return false; const snap=await getDoc(publicRef());if(!snap.exists())return false;const s=snap.data() as PublicGameState;const points=calculatePointsOnQuit(s.currentLadderLevel-1);await updateDoc(publicRef(),{stage:'CONTESTANT_QUIT','timer.isRunning':false,timerEndsAt:null,'hotSeatContestant.pointsWon':points});return true; }
+export async function contestantSelect(option: 'A'|'B'|'C'|'D') { if(!db) return false; const batch=writeBatch(db);batch.update(publicRef(),{selectedOption:option});batch.update(adminRef(),{selectedOption:option});await batch.commit();return true; }
+export async function contestantConfirm() { if(!db) return false; const batch=writeBatch(db);batch.update(publicRef(),{stage:'ANSWER_LOCKED','timer.isRunning':false,timerEndsAt:null});batch.update(adminRef(),{stage:'ANSWER_LOCKED','timer.isRunning':false,timerEndsAt:null});await batch.commit();return true; }
+export async function contestantQuit() { if(!db) return false; const snap=await getDoc(publicRef());if(!snap.exists())return false;const s=snap.data() as PublicGameState;const points=calculatePointsOnQuit(s.currentLadderLevel-1);const batch=writeBatch(db);const change={stage:'CONTESTANT_QUIT','timer.isRunning':false,timerEndsAt:null,'hotSeatContestant.pointsWon':points};batch.update(publicRef(),change);batch.update(adminRef(),change);await batch.commit();return true; }
 
 export async function resolveLocalTimerExpiry(): Promise<void> {
   if(!db)return;const snap=await getDoc(adminRef());if(!snap.exists())return;const data=snap.data() as AdminGameState & {timerEndsAt?:number|null;pollEndsAt?:number|null};const now=Date.now();let changed=false;if(data.timerEndsAt&&data.timerEndsAt<=now){data.timerEndsAt=null;data.timer.isRunning=false;data.timer.secondsRemaining=0;changed=true;}if(data.pollEndsAt&&data.pollEndsAt<=now){data.pollEndsAt=null;data.lifelines.audiencePoll.active=false;data.lifelines.audiencePoll.secondsRemaining=0;if(data.soundEnabled)data.soundTrigger={type:'poll-end',timestamp:now};changed=true;}if(changed)await withTimer(data,data.timerEndsAt??null,data.pollEndsAt??null);

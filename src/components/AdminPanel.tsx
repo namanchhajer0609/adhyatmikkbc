@@ -296,9 +296,12 @@ export const AdminPanel: React.FC = () => {
                     <Play className="w-4 h-4" /> Stage 1: Registration & Fastest Finger First
                   </h2>
                   <span className="text-[11px] text-slate-400">
-                    Participants tap 1st to 4th in sequence
+                    One fastest eligible audience member advances per round
                   </span>
                 </div>
+                <p className="text-[11px] text-slate-400">
+                  Up to 100 people can join. Run Fastest Finger First again after each contestant leaves; previous contestants are skipped, so the next person is selected one at a time.
+                </p>
 
                 <div className="flex flex-wrap items-center gap-3">
                   <button

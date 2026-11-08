@@ -1,0 +1,6 @@
+{
+  "name": "Adhyatmik KBC",
+  "description": "Live in-person spiritual quiz show platform with single-laptop extended display, Fastest Finger First, real-time Audience Poll, and 7 Crore Samvar Points prize ladder.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

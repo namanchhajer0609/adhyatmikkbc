@@ -14,13 +14,6 @@ const seatsRef = () => collection(db!, 'gameSessions', 'active', 'seats');
 const submissionsRef = () => collection(db!, 'gameSessions', 'active', 'fffSubmissions');
 const votesRef = () => collection(db!, 'gameSessions', 'active', 'pollVotes');
 
-const addSeatPoolToBatch = (batch: ReturnType<typeof writeBatch>, sessionId: string, roomCode: string) => {
-  for (let seat = 1; seat <= 100; seat++) {
-    const seatId = `${sessionId}-seat-${String(seat).padStart(3, '0')}`;
-    batch.set(doc(seatsRef(), seatId), { sessionId, roomCode, claimed: false });
-  }
-};
-
 const makeInitialAdminState = (): AdminGameState => {
   const questions = JSON.parse(JSON.stringify(INITIAL_QUESTIONS)) as SpiritualQuestion[];
   const fffBank = JSON.parse(JSON.stringify(INITIAL_FFF_QUESTIONS));
@@ -77,21 +70,11 @@ const toPublicState = (admin: AdminGameState): PublicGameState => {
 export async function ensureLiveGame(): Promise<void> {
   if (!db) throw new Error('Firestore is not configured.');
   const snapshot = await getDoc(adminRef());
-  if (snapshot.exists()) {
-    const current = snapshot.data() as AdminGameState;
-    const seats = await getDocs(query(seatsRef(), where('sessionId', '==', current.sessionId)));
-    if (seats.empty) {
-      const batch = writeBatch(db);
-      addSeatPoolToBatch(batch, current.sessionId, current.roomCode);
-      await batch.commit();
-    }
-    return;
-  }
+  if (snapshot.exists()) return;
   const initial = makeInitialAdminState();
   const batch = writeBatch(db);
   batch.set(adminRef(), { ...initial, timerEndsAt: null, pollEndsAt: null });
   batch.set(publicRef(), { ...toPublicState(initial), timerEndsAt: null, pollEndsAt: null });
-  addSeatPoolToBatch(batch, initial.sessionId, initial.roomCode);
   await batch.commit();
 }
 
@@ -116,52 +99,30 @@ export const subscribeFffSubmissions = (start: number, next: (items: AdminGameSt
 })), error) : () => {};
 export const subscribePollVotes = (pollId: string, next: (votes: Record<string, string>) => void, error: (e: Error) => void) => db ? onSnapshot(query(votesRef(), where('pollId', '==', pollId)), s => next(Object.fromEntries(s.docs.map(d => [d.id, d.data().optionKey]))), error) : () => {};
 
-function withTimer(admin: AdminGameState, timerEndsAt: number | null, pollEndsAt: number | null, resetSeats = false) {
+function withTimer(admin: AdminGameState, timerEndsAt: number | null, pollEndsAt: number | null) {
   const batch = writeBatch(db!);
   batch.set(adminRef(), { ...admin, timerEndsAt, pollEndsAt });
   batch.set(publicRef(), { ...toPublicState(admin), timerEndsAt, pollEndsAt });
-  if (resetSeats) addSeatPoolToBatch(batch, admin.sessionId, admin.roomCode);
   return batch.commit();
 }
 
 export async function registerGuest(name: string, roomCode: string, participantId: string): Promise<{ id: string; name: string } | null> {
   if (!db) return null;
   const cleanName = name.trim();
-  void participantId;
   if (cleanName.length < 2 || cleanName.length > 40) throw new Error('Name must be between 2 and 40 characters.');
   const normalizedRoom = roomCode.trim().toUpperCase();
-  for (let attempt = 0; attempt < 12; attempt++) {
-    const publicSnapshot = await getDoc(publicRef());
+  const pRef = doc(participantsRef(), participantId);
+  const seatRef = doc(seatsRef(), participantId);
+  await runTransaction(db, async tx => {
+    const publicSnapshot = await tx.get(publicRef());
     if (!publicSnapshot.exists()) throw new Error('The game is not ready yet. Ask the host to open the show controls.');
     const state = publicSnapshot.data() as PublicGameState;
     if (!state.registrationOpen) throw new Error('Registration is currently closed by the operator.');
     if (normalizedRoom !== state.roomCode.toUpperCase()) throw new Error(`Incorrect room code. Use ${state.roomCode}.`);
-    const openSeats = await getDocs(query(seatsRef(), where('sessionId', '==', state.sessionId), where('claimed', '==', false)));
-    if (openSeats.empty) throw new Error('This game is full. The host has reached the 100 audience limit.');
-    const seatDoc = openSeats.docs[Math.floor(Math.random() * openSeats.size)];
-    const seatId = seatDoc.id;
-    const seatRef = doc(seatsRef(), seatId);
-    const pRef = doc(participantsRef(), seatId);
-    try {
-      await runTransaction(db, async tx => {
-        const [freshPublic, seatSnapshot] = await Promise.all([tx.get(publicRef()), tx.get(seatRef)]);
-        if (!freshPublic.exists()) throw new Error('The game is not ready yet. Ask the host to open the show controls.');
-        const fresh = freshPublic.data() as PublicGameState;
-        if (!fresh.registrationOpen) throw new Error('Registration is currently closed by the operator.');
-        if (fresh.sessionId !== state.sessionId || fresh.roomCode.toUpperCase() !== normalizedRoom) throw new Error('The room changed. Refresh and try again.');
-        if (!seatSnapshot.exists() || seatSnapshot.data().claimed !== false) throw new Error('SEAT_TAKEN');
-        tx.update(seatRef, { claimed: true });
-        tx.set(pRef, { id: seatId, seatId, name: cleanName, roomCode: fresh.roomCode, sessionId: fresh.sessionId, registeredAt: Date.now() });
-      });
-      return { id: seatId, name: cleanName };
-    } catch (cause) {
-      const error = cause as { code?: string; message?: string };
-      const retryable = error.message === 'SEAT_TAKEN' || ['permission-denied', 'aborted', 'failed-precondition'].includes(error.code ?? '');
-      if (!retryable || attempt === 11) throw cause;
-      await new Promise(resolve => setTimeout(resolve, 20 + Math.random() * 80));
-    }
-  }
-  throw new Error('Could not reserve a seat. Please try again.');
+    tx.set(seatRef, { sessionId: state.sessionId, roomCode: state.roomCode, claimed: true });
+    tx.set(pRef, { id: participantId, seatId: participantId, name: cleanName, roomCode: state.roomCode, sessionId: state.sessionId, registeredAt: Date.now() });
+  });
+  return { id: participantId, name: cleanName };
 }
 
 export async function submitGuestFff(participant: { id: string; name: string }, order: string[]): Promise<boolean> {
@@ -229,7 +190,7 @@ export async function executeLiveAdminAction(action: string, payload?: Record<st
   }
   next.activeQuestion = next.fullActiveQuestion ? { ...next.fullActiveQuestion, correctOption: next.activeQuestionRevealed ? next.fullActiveQuestion.correctOption : null, explanation: next.activeQuestionRevealed ? next.fullActiveQuestion.explanation : null } : null;
   next.fffQuestion = next.fullFffQuestion ?? next.fffQuestion;
-  await withTimer(next, timerEndsAt, pollEndsAt, action === 'CREATE_SESSION');
+  await withTimer(next, timerEndsAt, pollEndsAt);
   return true;
 }
 

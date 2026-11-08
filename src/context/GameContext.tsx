@@ -268,9 +268,10 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // Register participant from /join
   const registerParticipant = useCallback(async (name: string, roomCode?: string) => {
     try {
-      const id = currentParticipant?.sessionId === state?.sessionId && currentParticipant?.id
-        ? currentParticipant.id
-        : (typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `guest-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      if (currentParticipant?.sessionId === state?.sessionId) return currentParticipant;
+      const id = typeof crypto !== 'undefined' && 'randomUUID' in crypto
+        ? crypto.randomUUID()
+        : `guest-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const participant = await registerGuest(name, roomCode ?? state?.roomCode ?? '', id);
       if (!participant) return null;
       const savedParticipant = { ...participant, sessionId: state?.sessionId };

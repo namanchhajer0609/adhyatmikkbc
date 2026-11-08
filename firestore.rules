@@ -72,17 +72,14 @@ service cloud.firestore {
 
     match /gameSessions/active/seats/{seatId} {
       allow read: if true;
-      allow create: if isAdminOrHost();
-      allow update: if request.auth == null &&
-        resource.data.claimed == false &&
+      allow create: if isAdminOrHost() || (request.auth == null &&
         request.resource.data.claimed == true &&
-        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['claimed']) &&
-        resource.data.sessionId == publicState().sessionId &&
-        resource.data.roomCode == publicState().roomCode &&
+        request.resource.data.sessionId == publicState().sessionId &&
+        request.resource.data.roomCode == publicState().roomCode &&
         publicState().registrationOpen == true &&
         existsAfter(/databases/$(database)/documents/gameSessions/active/participants/$(seatId)) &&
-        getAfter(/databases/$(database)/documents/gameSessions/active/participants/$(seatId)).data.seatId == seatId;
-      allow delete: if isAdminOrHost();
+        getAfter(/databases/$(database)/documents/gameSessions/active/participants/$(seatId)).data.seatId == seatId);
+      allow update, delete: if isAdminOrHost();
     }
 
     match /gameSessions/active/fffSubmissions/{participantId} {

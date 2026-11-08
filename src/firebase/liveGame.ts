@@ -109,18 +109,13 @@ export async function registerGuest(name: string, roomCode: string, participantI
   const cleanName = name.trim();
   const pRef = doc(participantsRef(), participantId);
   await runTransaction(db, async tx => {
-    const [pub, person] = await Promise.all([tx.get(publicRef()), tx.get(pRef)]);
+    const pub = await tx.get(publicRef());
     if (!pub.exists()) throw new Error('The game is not ready yet. Ask the host to open the show controls.');
     const state = pub.data() as PublicGameState;
-    if (person.exists()) {
-      if (person.data().sessionId === state.sessionId) return;
-      throw new Error('Refresh the page and join the current show again.');
-    }
     if (!state.registrationOpen) throw new Error('Registration is currently closed by the operator.');
     if (state.participantCount >= 100) throw new Error('This game is full. The host has reached the 100 audience limit.');
     if (roomCode.trim().toUpperCase() !== state.roomCode.toUpperCase()) throw new Error(`Incorrect room code. Use ${state.roomCode}.`);
     if (cleanName.length < 2) throw new Error('Please enter a name with at least 2 characters.');
-    if (person.exists()) return;
     tx.set(pRef, { id: participantId, name: cleanName, roomCode: state.roomCode, sessionId: state.sessionId, registeredAt: Date.now() });
     tx.update(publicRef(), { participantCount: increment(1) });
   });
@@ -129,14 +124,11 @@ export async function registerGuest(name: string, roomCode: string, participantI
 
 export async function submitGuestFff(participant: { id: string; name: string }, order: string[]): Promise<boolean> {
   if (!db) return false;
-  const [pub, person] = await Promise.all([getDoc(publicRef()), getDoc(doc(participantsRef(), participant.id))]);
-  if (!pub.exists() || !person.exists()) throw new Error('Join the audience first.');
+  const pub = await getDoc(publicRef());
+  if (!pub.exists()) throw new Error('Join the audience first.');
   const state = pub.data() as PublicGameState;
-  if (person.data().sessionId !== state.sessionId) throw new Error('Refresh and join the current show again.');
   if (state.stage !== 'FFF_ACTIVE' || order.length !== 4) throw new Error('Fastest Finger First is not accepting this submission.');
   const oldRef = doc(submissionsRef(), participant.id);
-  const old = await getDoc(oldRef);
-  if (old.exists() && old.data().roundStart === state.fffStartTime) throw new Error('You already submitted this round.');
   await setDoc(oldRef, { participantId: participant.id, name: participant.name, submittedOrder: order, roundStart: state.fffStartTime, serverReceivedTimestamp: serverTimestamp() });
   return true;
 }
@@ -148,8 +140,6 @@ export async function submitGuestVote(participant: { id: string; name: string },
   const state = pub.data() as PublicGameState & { pollId?: string };
   if (!state.lifelines.audiencePoll.active || !state.pollId) throw new Error('The audience poll is closed.');
   const ref = doc(votesRef(), participant.id);
-  const old = await getDoc(ref);
-  if (old.exists() && old.data().pollId === state.pollId) throw new Error('You already voted in this poll.');
   await setDoc(ref, { participantId: participant.id, name: participant.name, optionKey, pollId: state.pollId, timestamp: serverTimestamp() });
   return true;
 }
